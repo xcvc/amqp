@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"pack.ag/amqp"
+	"github.com/xcvc/amqp"
 )
 
 func Example() {

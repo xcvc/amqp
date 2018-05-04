@@ -1,4 +1,4 @@
-PACKAGE := pack.ag/amqp
+PACKAGE := github.com/xcvc/amqp
 FUZZ_DIR := ./fuzz
 
 all: test
