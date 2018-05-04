@@ -1390,6 +1390,23 @@ func LinkReceiverSettle(mode ReceiverSettleMode) LinkOption {
 	}
 }
 
+// LinkFilter sets a filter on the link source.
+func LinkFilter(name string, code uint64, value string) LinkOption {
+	return func(l *link) error {
+		if l.source == nil {
+			l.source = new(source)
+		}
+		if l.source.Filter == nil {
+			l.source.Filter = make(map[symbol]*describedType)
+		}
+		l.source.Filter[symbol(name)] = &describedType{
+			descriptor: code,
+			value:      value,
+		}
+		return nil
+	}
+}
+
 // LinkSelectorFilter sets a selector filter (apache.org:selector-filter:string) on the link source.
 func LinkSelectorFilter(filter string) LinkOption {
 	// <descriptor name="apache.org:selector-filter:string" code="0x0000468C:0x00000004"/>
