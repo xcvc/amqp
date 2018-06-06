@@ -566,10 +566,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 						continue
 					}
 
-					select {
-					case <-s.conn.done:
-					case link.rx <- fr.body:
-					}
+					s.muxFrameToLink(link, fr.body)
 				}
 				continue
 			case *performFlow:
@@ -612,10 +609,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 						continue
 					}
 
-					select {
-					case <-s.conn.done:
-					case link.rx <- fr.body:
-					}
+					s.muxFrameToLink(link, fr.body)
 					continue
 				}
 
@@ -644,10 +638,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				link.remoteHandle = body.Handle
 				links[link.remoteHandle] = link
 
-				select {
-				case <-s.conn.done:
-				case link.rx <- fr.body:
-				}
+				s.muxFrameToLink(link, fr.body)
 
 			case *performTransfer:
 				// "Upon receiving a transfer, the receiving endpoint will
@@ -686,11 +677,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				if !ok {
 					continue
 				}
-
-				select {
-				case <-s.conn.done:
-				case link.rx <- fr.body:
-				}
+				s.muxFrameToLink(link, fr.body)
 
 			case *performEnd:
 				s.txFrame(&performEnd{}, nil)
@@ -761,6 +748,14 @@ func (s *Session) mux(remoteBegin *performBegin) {
 	}
 }
 
+func (s *Session) muxFrameToLink(l *link, fr frameBody) {
+	select {
+	case l.rx <- fr:
+	case <-l.done:
+	case <-s.conn.done:
+	}
+}
+
 // DetachError is returned by a link (Receiver/Sender) when a detach frame is received.
 //
 // RemoteError will be nil if the link was detached gracefully.
@@ -783,21 +778,22 @@ const (
 //
 // May be used for sending or receiving.
 type link struct {
-	name         string               // our name
-	handle       uint32               // our handle
-	remoteHandle uint32               // remote's handle
-	dynamicAddr  bool                 // request a dynamic link address from the server
-	rx           chan frameBody       // sessions sends frames for this link on this channel
-	transfers    chan performTransfer // sender uses for send; receiver uses for receive
-	close        chan struct{}
-	closeOnce    sync.Once
-	done         chan struct{}
-	doneOnce     sync.Once
-	session      *Session  // parent session
-	receiver     *Receiver // allows link options to modify Receiver
-	source       *source
-	target       *target
-	properties   map[symbol]interface{} // additional properties sent upon link attach
+	name          string               // our name
+	handle        uint32               // our handle
+	remoteHandle  uint32               // remote's handle
+	dynamicAddr   bool                 // request a dynamic link address from the server
+	rx            chan frameBody       // sessions sends frames for this link on this channel
+	transfers     chan performTransfer // sender uses for send; receiver uses for receive
+	closeOnce     sync.Once            // closeOnce protects close from being closed multiple times
+	close         chan struct{}        // close signals the mux to shutdown
+	done          chan struct{}        // done is closed by mux/muxDetach when the link is fully detached
+	detachErrorMu sync.Mutex           // protects detachError
+	detachError   *Error               // error to send to remote on detach, set by closeWithError
+	session       *Session             // parent session
+	receiver      *Receiver            // allows link options to modify Receiver
+	source        *source
+	target        *target
+	properties    map[symbol]interface{} // additional properties sent upon link attach
 
 	// "The delivery-count is initialized by the sender when a link endpoint is created,
 	// and is incremented whenever a message is sent. Only the sender MAY independently
@@ -810,7 +806,6 @@ type link struct {
 	senderSettleMode   *SenderSettleMode
 	receiverSettleMode *ReceiverSettleMode
 	maxMessageSize     uint64
-	detachSent         bool // detach frame has been sent
 	detachReceived     bool
 	err                error // err returned on Close()
 }
@@ -946,122 +941,14 @@ func newLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 }
 
 func (l *link) mux() {
-	defer l.detach()
+	defer l.muxDetach()
 
 	var (
-		isReceiver             = l.receiver != nil
-		isSender               = !isReceiver
-		errOnRejectDisposition = isSender && (l.receiverSettleMode == nil || *l.receiverSettleMode == ModeFirst)
+		isReceiver = l.receiver != nil
+		isSender   = !isReceiver
 	)
 
-	handleRx := func(fr frameBody) bool {
-		switch fr := fr.(type) {
-		// message frame
-		case *performTransfer:
-			debug(3, "RX: %s", fr)
-			if isSender {
-				// Senders should never receive transfer frames, but handle it just in case.
-				l.session.txFrame(&performDetach{
-					Handle: l.handle,
-					Closed: true,
-					Error: &Error{
-						Condition:   ErrorNotAllowed,
-						Description: "sender cannot process transfer frame",
-					},
-				}, nil)
-				l.detachSent = true
-				l.err = errorErrorf("sender received transfer frame")
-				return false
-			}
-
-			l.transfers <- *fr
-
-			// decrement link-credit after entire message received
-			if !fr.More {
-				l.deliveryCount++
-				l.linkCredit--
-			}
-
-		// flow control frame
-		case *performFlow:
-			debug(3, "RX: %s", fr)
-			if isReceiver {
-				if fr.DeliveryCount != nil {
-					l.deliveryCount = *fr.DeliveryCount
-				}
-			} else {
-				l.linkCredit = *fr.LinkCredit - l.deliveryCount
-				if fr.DeliveryCount != nil {
-					// DeliveryCount can be nil if the receiver hasn't processed
-					// the attach. That shouldn't be the case here, but it's
-					// what ActiveMQ does.
-					l.linkCredit += *fr.DeliveryCount
-				}
-			}
-
-			if fr.Echo {
-				var (
-					// copy because sent by pointer below; prevent race
-					linkCredit    = l.linkCredit
-					deliveryCount = l.deliveryCount
-				)
-
-				// send flow
-				fr := &performFlow{
-					Handle:        &l.handle,
-					DeliveryCount: &deliveryCount,
-					LinkCredit:    &linkCredit, // max number of messages
-				}
-				debug(1, "TX: %s", fr)
-				l.session.txFrame(fr, nil)
-			}
-
-		// remote side is closing links
-		case *performDetach:
-			debug(1, "RX: %s", fr)
-			// don't currently support link detach and reattach
-			if !fr.Closed {
-				l.err = errorErrorf("non-closing detach not supported: %+v", fr)
-				return false
-			}
-
-			// set detach received and close link
-			l.detachReceived = true
-
-			l.err = errorWrapf(DetachError{fr.Error}, "received detach frame")
-			return false
-
-		case *performDisposition:
-			debug(3, "RX: %s", fr)
-
-			// If sending async and a message is rejected, cause a link error.
-			//
-			// This isn't ideal, but there isn't a clear better way to handle it.
-			if fr, ok := fr.State.(*stateRejected); ok && errOnRejectDisposition {
-				l.err = fr.Error
-				return false
-			}
-
-			if fr.Settled {
-				return true
-			}
-
-			resp := &performDisposition{
-				Role:    roleSender,
-				First:   fr.First,
-				Last:    fr.Last,
-				Settled: true,
-			}
-			debug(1, "TX: %s", resp)
-			l.session.txFrame(resp, nil)
-
-		default:
-			debug(1, "RX: %s", fr)
-			fmt.Printf("Unexpected frame: %s\n", fr)
-		}
-		return true
-	}
-
+Loop:
 	for {
 		var outgoingTransfers chan performTransfer
 		switch {
@@ -1071,56 +958,37 @@ func (l *link) mux() {
 
 		// if receiver and linkCredit is half used, send more
 		case isReceiver && l.linkCredit <= l.receiver.maxCredit/2:
-			var (
-				// copy because sent by pointer below; prevent race
-				linkCredit    = l.receiver.maxCredit
-				deliveryCount = l.deliveryCount
-			)
-
-			// send flow
-			fr := &performFlow{
-				Handle:        &l.handle,
-				DeliveryCount: &deliveryCount,
-				LinkCredit:    &linkCredit, // max number of messages
+			l.err = l.muxFlow()
+			if l.err != nil {
+				return
 			}
-			debug(3, "TX: %s", fr)
-		FlowLoop:
-			for {
-				// Ensure we never block the session mux
-				select {
-				case l.session.tx <- fr:
-					break FlowLoop
-				case fr := <-l.rx:
-					if !handleRx(fr) {
-						return
-					}
-				case <-l.close:
-					l.err = ErrLinkClosed
-					return
-				case <-l.session.done:
-					l.err = l.session.err
-					return
-				}
-			}
-
-			// reset credit
-			l.linkCredit = l.receiver.maxCredit
 		}
 
-		// TODO: Look into avoiding the select statement duplication.
-
 		select {
+		// received frame
+		case fr := <-l.rx:
+			l.err = l.muxHandleFrame(fr)
+			if l.err != nil {
+				return
+			}
+
 		// send data
 		case tr := <-outgoingTransfers:
 			debug(3, "TX(link): %s", tr)
-		Loop:
+
+			// Ensure the session mux is not blocked
 			for {
-				// Ensure we never block the session mux
 				select {
 				case l.session.txTransfer <- &tr:
-					break Loop
+					// decrement link-credit after entire message transferred
+					if !tr.More {
+						l.deliveryCount++
+						l.linkCredit--
+					}
+					continue Loop
 				case fr := <-l.rx:
-					if !handleRx(fr) {
+					l.err = l.muxHandleFrame(fr)
+					if l.err != nil {
 						return
 					}
 				case <-l.close:
@@ -1132,17 +1000,6 @@ func (l *link) mux() {
 				}
 			}
 
-			// decrement link-credit after entire message transferred
-			if !tr.More {
-				l.deliveryCount++
-				l.linkCredit--
-			}
-
-		// received frame
-		case fr := <-l.rx:
-			if !handleRx(fr) {
-				return
-			}
 		case <-l.close:
 			l.err = ErrLinkClosed
 			return
@@ -1151,6 +1008,147 @@ func (l *link) mux() {
 			return
 		}
 	}
+}
+
+// muxFlow sends tr to the session mux.
+func (l *link) muxFlow() error {
+	var (
+		// copy because sent by pointer below; prevent race
+		linkCredit    = l.receiver.maxCredit
+		deliveryCount = l.deliveryCount
+	)
+
+	fr := &performFlow{
+		Handle:        &l.handle,
+		DeliveryCount: &deliveryCount,
+		LinkCredit:    &linkCredit, // max number of messages
+	}
+	debug(3, "TX: %s", fr)
+
+	// Ensure the session mux is not blocked
+	for {
+		select {
+		case l.session.tx <- fr:
+			// reset credit
+			l.linkCredit = l.receiver.maxCredit
+			return nil
+		case fr := <-l.rx:
+			err := l.muxHandleFrame(fr)
+			if err != nil {
+				return err
+			}
+		case <-l.close:
+			return ErrLinkClosed
+		case <-l.session.done:
+			return l.session.err
+		}
+	}
+}
+
+// muxHandleFrame processes fr based on type.
+func (l *link) muxHandleFrame(fr frameBody) error {
+	var (
+		isSender               = l.receiver == nil
+		errOnRejectDisposition = isSender && (l.receiverSettleMode == nil || *l.receiverSettleMode == ModeFirst)
+	)
+
+	switch fr := fr.(type) {
+	// message frame
+	case *performTransfer:
+		debug(3, "RX: %s", fr)
+		if isSender {
+			// Senders should never receive transfer frames, but handle it just in case.
+			l.closeWithError(&Error{
+				Condition:   ErrorNotAllowed,
+				Description: "sender cannot process transfer frame",
+			})
+			return errorErrorf("sender received transfer frame")
+		}
+
+		l.transfers <- *fr
+
+		// decrement link-credit after entire message received
+		if !fr.More {
+			l.deliveryCount++
+			l.linkCredit--
+		}
+
+	// flow control frame
+	case *performFlow:
+		debug(3, "RX: %s", fr)
+		if isSender {
+			l.linkCredit = *fr.LinkCredit - l.deliveryCount
+			if fr.DeliveryCount != nil {
+				// DeliveryCount can be nil if the receiver hasn't processed
+				// the attach. That shouldn't be the case here, but it's
+				// what ActiveMQ does.
+				l.linkCredit += *fr.DeliveryCount
+			}
+		} else if fr.DeliveryCount != nil {
+			l.deliveryCount = *fr.DeliveryCount
+		}
+
+		if !fr.Echo {
+			return nil
+		}
+
+		var (
+			// copy because sent by pointer below; prevent race
+			linkCredit    = l.linkCredit
+			deliveryCount = l.deliveryCount
+		)
+
+		// send flow
+		resp := &performFlow{
+			Handle:        &l.handle,
+			DeliveryCount: &deliveryCount,
+			LinkCredit:    &linkCredit, // max number of messages
+		}
+		debug(1, "TX: %s", resp)
+		l.session.txFrame(resp, nil)
+
+	// remote side is closing links
+	case *performDetach:
+		debug(1, "RX: %s", fr)
+		// don't currently support link detach and reattach
+		if !fr.Closed {
+			return errorErrorf("non-closing detach not supported: %+v", fr)
+		}
+
+		// set detach received and close link
+		l.detachReceived = true
+
+		return errorWrapf(DetachError{fr.Error}, "received detach frame")
+
+	case *performDisposition:
+		debug(3, "RX: %s", fr)
+
+		// If sending async and a message is rejected, cause a link error.
+		//
+		// This isn't ideal, but there isn't a clear better way to handle it.
+		if fr, ok := fr.State.(*stateRejected); ok && errOnRejectDisposition {
+			return fr.Error
+		}
+
+		if fr.Settled {
+			return nil
+		}
+
+		resp := &performDisposition{
+			Role:    roleSender,
+			First:   fr.First,
+			Last:    fr.Last,
+			Settled: true,
+		}
+		debug(1, "TX: %s", resp)
+		l.session.txFrame(resp, nil)
+
+	default:
+		debug(1, "RX: %s", fr)
+		fmt.Printf("Unexpected frame: %s\n", fr)
+	}
+
+	return nil
 }
 
 // close closes and requests deletion of the link.
@@ -1173,8 +1171,32 @@ func (l *link) Close(ctx context.Context) error {
 	return l.err
 }
 
-func (l *link) detach() {
-	defer l.doneOnce.Do(func() { close(l.done) })
+func (l *link) closeWithError(de *Error) {
+	l.closeOnce.Do(func() {
+		l.detachErrorMu.Lock()
+		l.detachError = de
+		l.detachErrorMu.Unlock()
+		close(l.close)
+	})
+}
+
+func (l *link) muxDetach() {
+	defer func() {
+		// final cleanup and signaling
+
+		// deallocate handle
+		select {
+		case l.session.deallocateHandle <- l:
+		case <-l.session.done:
+			if l.err == nil {
+				l.err = l.session.err
+			}
+		}
+
+		// signal other goroutines that links is done
+		close(l.done)
+	}()
+
 	// "A peer closes a link by sending the detach frame with the
 	// handle for the specified link, and the closed flag set to
 	// true. The partner will destroy the corresponding link
@@ -1185,13 +1207,15 @@ func (l *link) detach() {
 	// partner is sending a non-closing detach. In this case,
 	// the partner MUST signal that it has closed the link by
 	// reattaching and then sending a closing detach."
-	if l.detachSent {
-		return
-	}
+
+	l.detachErrorMu.Lock()
+	detachError := l.detachError
+	l.detachErrorMu.Unlock()
 
 	fr := &performDetach{
 		Handle: l.handle,
 		Closed: true,
+		Error:  detachError,
 	}
 	select {
 	case l.session.tx <- fr:
@@ -1201,30 +1225,20 @@ func (l *link) detach() {
 		}
 		return
 	}
-	l.detachSent = true
 
-	// already received detach from remote
-	if l.detachReceived {
-		select {
-		case l.session.deallocateHandle <- l:
-		case <-l.session.done:
-			if l.err == nil {
-				l.err = l.session.err
-			}
-		}
+	// don't wait for remote to detach when already
+	// received or closing due to error
+	if l.detachReceived || detachError != nil {
 		return
 	}
 
-	// wait for remote to detach
-outer:
 	for {
-		// TODO: timeout
 		select {
 		// read from link until detach with Close == true is received,
 		// other frames are discarded.
 		case fr := <-l.rx:
 			if fr, ok := fr.(*performDetach); ok && fr.Closed {
-				break outer
+				return
 			}
 
 		// connection has ended
@@ -1234,16 +1248,6 @@ outer:
 			}
 			return
 		}
-	}
-
-	// deallocate handle
-	select {
-	case l.session.deallocateHandle <- l:
-	case <-l.session.done:
-		if l.err == nil {
-			l.err = l.session.err
-		}
-		return
 	}
 }
 
@@ -1407,14 +1411,22 @@ func LinkFilter(name string, code uint64, value string) LinkOption {
 	}
 }
 
+// LinkSessionFilter sets a session filter (com.microsoft:session-filter) on the link source.
+// This is used in Azure Service Bus to filter messages by session ID on a receiving link.
+func LinkSessionFilter(sessionID string) LinkOption {
+	// <descriptor name="com.microsoft:session-filter" code="00000013:7000000C"/>
+	return linkSourceFilter("com.microsoft:session-filter", uint64(0x00000137000000C), sessionID)
+}
+
 // LinkSelectorFilter sets a selector filter (apache.org:selector-filter:string) on the link source.
 func LinkSelectorFilter(filter string) LinkOption {
 	// <descriptor name="apache.org:selector-filter:string" code="0x0000468C:0x00000004"/>
-	const (
-		name = symbol("apache.org:selector-filter:string")
-		code = uint64(0x0000468C00000004)
-	)
+	return linkSourceFilter("apache.org:selector-filter:string", uint64(0x0000468C00000004), filter)
+}
 
+// linkSourceFilter sets a filter on the link source.
+func linkSourceFilter(name string, code uint64, value string) LinkOption {
+	nameSym := symbol(name)
 	return func(l *link) error {
 		if l.source == nil {
 			l.source = new(source)
@@ -1422,9 +1434,9 @@ func LinkSelectorFilter(filter string) LinkOption {
 		if l.source.Filter == nil {
 			l.source.Filter = make(map[symbol]*describedType)
 		}
-		l.source.Filter[name] = &describedType{
+		l.source.Filter[nameSym] = &describedType{
 			descriptor: code,
-			value:      filter,
+			value:      value,
 		}
 		return nil
 	}
@@ -1495,9 +1507,12 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 		// ensure maxMessageSize will not be exceeded
 		messageSize += uint64(len(fr.Payload))
 		if maxMessageSize != 0 && messageSize > maxMessageSize {
-			// TODO: send error
-			_ = r.Close(ctx)
-			return nil, errorErrorf("received message larger than max size of %d", maxMessageSize)
+			msg := fmt.Sprintf("received message larger than max size of %d", maxMessageSize)
+			r.link.closeWithError(&Error{
+				Condition:   ErrorMessageSizeExceeded,
+				Description: msg,
+			})
+			return nil, errorNew(msg)
 		}
 
 		// add the payload the the buffer
@@ -1544,19 +1559,11 @@ func (r *Receiver) Close(ctx context.Context) error {
 }
 
 type messageDisposition struct {
-	id          deliveryID
-	disposition disposition
+	id    deliveryID
+	state interface{}
 }
 
 type deliveryID uint32
-
-type disposition int
-
-const (
-	dispositionAccept disposition = iota
-	dispositionReject
-	dispositionRelease
-)
 
 func (r *Receiver) dispositionBatcher() {
 	// batch operations:
@@ -1582,16 +1589,17 @@ func (r *Receiver) dispositionBatcher() {
 		case msgDis := <-r.dispositions:
 
 			// not accepted or batch out of order
-			if msgDis.disposition != dispositionAccept || (batchStarted && last+1 != msgDis.id) {
+			_, isAccept := msgDis.state.(*stateAccepted)
+			if !isAccept || (batchStarted && last+1 != msgDis.id) {
 				// send the current batch, if any
 				if batchStarted {
 					lastCopy := last
-					r.sendDisposition(first, &lastCopy, dispositionAccept)
+					r.sendDisposition(first, &lastCopy, &stateAccepted{})
 					batchStarted = false
 				}
 
 				// send the current message
-				r.sendDisposition(msgDis.id, nil, msgDis.disposition)
+				r.sendDisposition(msgDis.id, nil, msgDis.state)
 				continue
 			}
 
@@ -1609,7 +1617,7 @@ func (r *Receiver) dispositionBatcher() {
 			// send batch if current size == batchSize
 			if uint32(last-first+1) >= batchSize {
 				lastCopy := last
-				r.sendDisposition(first, &lastCopy, dispositionAccept)
+				r.sendDisposition(first, &lastCopy, &stateAccepted{})
 				batchStarted = false
 				if !batchTimer.Stop() {
 					<-batchTimer.C // batch timer must be drained if stop returns false
@@ -1619,7 +1627,7 @@ func (r *Receiver) dispositionBatcher() {
 		// maxBatchAge elapsed, send batch
 		case <-batchTimer.C:
 			lastCopy := last
-			r.sendDisposition(first, &lastCopy, dispositionAccept)
+			r.sendDisposition(first, &lastCopy, &stateAccepted{})
 			batchStarted = false
 			batchTimer.Stop()
 
@@ -1630,49 +1638,25 @@ func (r *Receiver) dispositionBatcher() {
 }
 
 // sendDisposition sends a disposition frame to the peer
-func (r *Receiver) sendDisposition(first deliveryID, last *deliveryID, disp disposition) {
+func (r *Receiver) sendDisposition(first deliveryID, last *deliveryID, state interface{}) {
 	fr := &performDisposition{
 		Role:    roleReceiver,
 		First:   uint32(first),
 		Last:    (*uint32)(last),
 		Settled: r.link.receiverSettleMode == nil || *r.link.receiverSettleMode == ModeFirst,
-	}
-
-	switch disp {
-	case dispositionAccept:
-		fr.State = new(stateAccepted)
-	case dispositionReject:
-		fr.State = new(stateRejected)
-	case dispositionRelease:
-		fr.State = new(stateReleased)
+		State:   state,
 	}
 
 	debug(1, "TX: %s", fr)
 	r.link.session.txFrame(fr, nil)
 }
 
-func (r *Receiver) acceptMessage(id deliveryID) {
+func (r *Receiver) messageDisposition(id deliveryID, state interface{}) {
 	if r.batching {
-		r.dispositions <- messageDisposition{id: id, disposition: dispositionAccept}
+		r.dispositions <- messageDisposition{id: id, state: state}
 		return
 	}
-	r.sendDisposition(id, nil, dispositionAccept)
-}
-
-func (r *Receiver) rejectMessage(id deliveryID) {
-	if r.batching {
-		r.dispositions <- messageDisposition{id: id, disposition: dispositionReject}
-		return
-	}
-	r.sendDisposition(id, nil, dispositionReject)
-}
-
-func (r *Receiver) releaseMessage(id deliveryID) {
-	if r.batching {
-		r.dispositions <- messageDisposition{id: id, disposition: dispositionRelease}
-		return
-	}
-	r.sendDisposition(id, nil, dispositionRelease)
+	r.sendDisposition(id, nil, state)
 }
 
 const maxTransferFrameHeader = 66 // determined by calcMaxTransferFrameHeader
