@@ -462,6 +462,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 
 		// flow control values
 		nextOutgoingID       uint32
+		incomingWindow       = s.incomingWindow
 		nextIncomingID       = remoteBegin.NextOutgoingID
 		remoteIncomingWindow = remoteBegin.IncomingWindow
 		remoteOutgoingWindow = remoteBegin.OutgoingWindow
@@ -648,6 +649,7 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				// (depending on policy) decrement its incoming-window."
 				nextIncomingID++
 				remoteOutgoingWindow--
+				incomingWindow--
 				link, ok := links[body.Handle]
 				if !ok {
 					continue
@@ -658,8 +660,8 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				case link.rx <- fr.body:
 				}
 
-				// Update peer's outgoing window if half has been consumed.
-				if remoteOutgoingWindow < s.incomingWindow/2 {
+				if incomingWindow < s.incomingWindow/2 {
+					incomingWindow = s.incomingWindow
 					nID := nextIncomingID
 					flow := &performFlow{
 						NextIncomingID: &nID,
@@ -669,7 +671,6 @@ func (s *Session) mux(remoteBegin *performBegin) {
 					}
 					debug(1, "TX(Session): %s", flow)
 					s.txFrame(flow, nil)
-					remoteOutgoingWindow = s.incomingWindow
 				}
 
 			case *performDetach:
@@ -737,7 +738,6 @@ func (s *Session) mux(remoteBegin *performBegin) {
 				fr.OutgoingWindow = s.outgoingWindow
 				debug(1, "TX(Session): %s", fr)
 				s.txFrame(fr, nil)
-				remoteOutgoingWindow = s.incomingWindow
 			case *performTransfer:
 				panic("transfer frames must use txTransfer")
 			default:
