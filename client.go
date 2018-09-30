@@ -1366,6 +1366,15 @@ Loop:
 // A link may be a Sender or a Receiver.
 type LinkOption func(*link) error
 
+// LinkName sets the link name.
+func LinkName(name string) LinkOption {
+	return func(l *link) error {
+		l.name = name
+
+		return nil
+	}
+}
+
 // LinkAddress sets the link address.
 //
 // For a Receiver this configures the source address.
@@ -1415,6 +1424,17 @@ func LinkSourceAddress(addr string) LinkOption {
 			l.source = new(source)
 		}
 		l.source.Address = addr
+		return nil
+	}
+}
+
+// LinkSourceShared sets shared subscriptions.
+func LinkSourceShared() LinkOption {
+	return func(l *link) error {
+		if l.source == nil {
+			l.source = new(source)
+		}
+		l.source.Capabilities = multiSymbol{"shared"}
 		return nil
 	}
 }
